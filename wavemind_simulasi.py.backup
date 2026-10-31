@@ -1,0 +1,559 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.ticker import MaxNLocator, FixedLocator
+import tkinter as tk
+from tkinter import messagebox
+import serial
+import threading
+from collections import deque
+
+
+# Variabel global untuk menyimpan hasil simulasi
+hasil = {}
+
+# Variabel kontrol tampilan tambahan
+hor_pos = 0.0  # Horizontal position in seconds (default 0)
+ver_pos = 0.0  # Vertical position in volts (default 0)
+trig_level = 0.5  # Trigger level in volts (default 0.5)
+
+
+# --- Fungsi pengukuran otomatis dari data sinyal gelombang ---
+def hitung_ukuran_dari_data(hasil):
+    """Hitung ukuran gelombang dari data sinyal sebenarnya (bukan parameter input)"""
+    if not hasil or "sinyal" not in hasil or "waktu" not in hasil:
+        return {
+            "frekuensi_terukur": None,
+            "duty_cycle_terukur": None,
+            "tegangan_peak2peak": None,
+            "tegangan_max": None,
+            "tegangan_min": None,
+            "tegangan_rms": None,
+        }
+
+    sinyal = hasil["sinyal"]
+    waktu = hasil["waktu"]
+    n = len(sinyal)
+
+    # Konversi ke float untuk perhitungan voltage
+    sinyal_float = sinyal.astype(float)
+
+    # --- Ukuran Frekuensi dari data ---
+    # Deteksi transisi naik (0 -> 1) untuk menghitung periode
+    periode_terdeteksi = None
+    indeks_naik = []
+    for i in range(1, n):
+        if sinyal_float[i - 1] == 0 and sinyal_float[i] == 1:
+            indeks_naik.append(i)
+
+    if len(indeks_naik) >= 2:
+        # Gunakan dua transisi naik pertama untuk estimasi periode
+        dt = waktu[indeks_naik[1]] - waktu[indeks_naik[0]]
+        if dt > 0:
+            periode_terdeteksi = dt
+    frekuensi_terukur = (1.0 / periode_terdeteksi) if periode_terdeteksi else None
+
+    # --- Ukuran Duty Cycle dari data ---
+    # Hitung proporsi waktu HIGH per periode yang terdeteksi
+    duty_cycle_terukur = None
+    if periode_terdeteksi and len(indeks_naik) > 0:
+        # Untuk setiap transisi naik, hitung lama HIGH berikutnya
+        total_high = 0
+        count = 0
+        for idx in indeks_naik[:4]:  # Gunakan hingga 4 periode untuk akurasi
+            # Cari transisi turun selanjutnya
+            for j in range(idx + 1, n):
+                if sinyal_float[j - 1] == 1 and sinyal_float[j] == 0:
+                    high_duration = waktu[j] - waktu[idx]
+                    total_high += high_duration
+                    count += 1
+                    break
+            if count >= 4:
+                break
+        if count > 0:
+            rata_rata_period = periode_terdeteksi
+            duty_cycle_terukur = (total_high / (count * rata_rata_period)) * 100 if rata_rata_period > 0 else None
+
+    # --- Ukuran Tegangan dari data (setelah ver_pos shift) ---
+    sinial_shifted = sinyal_float + ver_pos  # Apply vertical position
+
+    tegangan_max = float(sinial_shifted.max()) if len(sinial_shifted) > 0 else None
+    tegangan_min = float(sinial_shifted.min()) if len(sinial_shifted) > 0 else None
+    tegangan_peak2peak = tegangan_max - tegangan_min if tegangan_max is not None and tegangan_min is not None else None
+
+    # RMS voltage (root mean square)
+    tegangan_rms = float(np.sqrt(np.mean(sinial_shifted ** 2))) if len(sinial_shifted) > 0 and np is not None else None
+
+    return {
+        "frekuensi_terukur": round(frekuensi_terukur, 2) if frekuensi_terukur else None,
+        "duty_cycle_terukur": round(duty_cycle_terukur, 1) if duty_cycle_terukur else None,
+        "tegangan_peak2peak": round(tegangan_peak2peak, 2) if tegangan_peak2peak else None,
+        "tegangan_max": round(tegangan_max, 2) if tegangan_max else None,
+        "tegangan_min": round(tegangan_min, 2) if tegangan_min else None,
+        "tegangan_rms": round(tegangan_rms, 3) if tegangan_rms else None,
+    }
+
+# --- Fungsi simulasi (dihormat dari wavemind_simulasi.py) ---
+def run_simulation(frekuensi, duty_cycle, durasi):
+    jumlah_titik = 2000
+    waktu = np.linspace(0, durasi, jumlah_titik)
+    periode = 1 / frekuensi
+    waktu_high = periode * duty_cycle / 100
+    waktu_low = periode - waktu_high
+
+    posisi = (waktu % periode) / periode
+    sinyal = (posisi < duty_cycle / 100).astype(int)
+
+    hasil = {
+        "frekuensi": frekuensi,
+        "periode": periode,
+        "duty_cycle": duty_cycle,
+        "waktu_high": waktu_high,
+        "waktu_low": waktu_low,
+        "sinyal": sinyal,
+        "waktu": waktu,
+    }
+    return hasil
+
+
+# --- Penjelasan hasil dalam bahasa Indonesia ---
+def penjelasan(hasil):
+    lines = [
+        f"Frekuensi   : {hasil['frekuensi']} Hz",
+        f"Periode     : {hasil['periode']:.3f} detik",
+        f"Duty Cycle  : {hasil['duty_cycle']}%",
+        f"Waktu HIGH  : {hasil['waktu_high']:.3f} detik",
+        f"Waktu LOW   : {hasil['waktu_low']:.3f} detik",
+    ]
+    if hasil["duty_cycle"] == 50:
+        lines.append("Sinyal memiliki waktu HIGH dan LOW yang sama.")
+    elif hasil["duty_cycle"] < 50:
+        lines.append("Sinyal memiliki waktu HIGH lebih singkat daripada LOW.")
+    else:
+        lines.append("Sinyal memiliki waktu HIGH lebih lama daripada LOW.")
+
+    # Tambahkan ukuran dari data sinyal sebenarnya
+    ukuran = hitung_ukuran_dari_data(hasil)
+    if ukuran["frekuensi_terukur"] is not None:
+        lines.append(f"Frekuensi terukur: {ukuran['frekuensi_terukur']} Hz")
+    if ukuran["duty_cycle_terukur"] is not None:
+        lines.append(f"Duty cycle terukur: {ukuran['duty_cycle_terukur']}%")
+    if ukuran["tegangan_peak2peak"] is not None:
+        lines.append(f"Tegangan peak-to-peak: {ukuran['tegangan_peak2peak']} V")
+    if ukuran["tegangan_max"] is not None:
+        lines.append(f"Tegangan max: {ukuran['tegangan_max']} V")
+    if ukuran["tegangan_min"] is not None:
+        lines.append(f"Tegangan min: {ukuran['tegangan_min']} V")
+    if ukuran["tegangan_rms"] is not None:
+        lines.append(f"Tegangan RMS: {ukuran['tegangan_rms']} V")
+
+    return "\n".join(lines)
+
+
+# --- Fungsi callback tombol Generate ---
+def on_generate():
+    global hasil
+    try:
+        frekuensi = float(entry_frekuensi.get())
+        duty_cycle = float(entry_duty.get())
+        durasi = float(entry_durasi.get())
+    except ValueError:
+        messagebox.showerror("Input Error", "Masukkan angka yang valid.")
+        return
+
+    if frekuensi <= 0:
+        messagebox.showerror("Input Error", "Frekuensi harus lebih besar dari nol.")
+        return
+    if not (0 <= duty_cycle <= 100):
+        messagebox.showerror("Input Error", "Duty cycle harus antara 0 hingga 100 persen.")
+        return
+
+    hasil = run_simulation(frekuensi, duty_cycle, durasi)
+
+    # Update text result
+    text_result.config(text=penjelasan(hasil))
+
+    # Update plot with display controls (uses current spinbox values)
+    update_plot(durasi)
+
+
+def auto_scale():
+    """Auto scale both axes based on current data and display settings"""
+    data = hasil["sinyal"]
+    t = hasil["waktu"]
+    
+    # Dapatkan nilai measured dari data sinyal sebenarnya
+    ukuran = hitung_ukuran_dari_data(hasil)
+    
+    # Dapatkan nilai current dari kontrol Volt/div dan Time/div
+    volt_div = float(spin_volt_div.get())
+    time_div = float(spin_time_div.get())
+    
+    # X-axis: auto scale berdasarkan data waktu dengan margin 10%
+    # Minimum range adalah Time/div x 10 divisi horizontal
+    t_min, t_max = t.min(), t.max()
+    margin_t = (t_max - t_min) * 0.1
+    x_data_max = max(t_max, time_div * 10)  # minimal time_div * 10
+    ax.set_xlim(t_min - margin_t, x_data_max + margin_t)
+    
+    # Y-axis: auto scale berdasarkan data sinyal dengan margin 10%
+    # Tapi tetap menghormati batas Volt/div x 8 divisi vertikal
+    # Gunakan ukuran terukur sebagai referensi jika tersedia
+    if ukuran["tegangan_peak2peak"] is not None:
+        # Referensi dari data sebenarnya
+        tegangan_pp_terukur = ukuran["tegangan_peak2peak"]
+    else:
+        tegangan_pp_terukur = None
+    
+    # Data maksimum dan minimum dari hasil sinyal mentah
+    data_max = max(data.max(), 1.0)  # minimal 1V untuk sinyal 0-1
+    data_min = min(data.min(), 0.0)
+    y_range = data_max - data_min
+    margin_v = y_range * 0.1 if y_range > 0 else 0.1
+    
+    # Batas Y: 0 sampai Volt/div x 8 divisi, tetapi bisa di-overide oleh range data
+    # jika data melebihi batas standar
+    y_standard_max = volt_div * 8
+    y_standard_min = 0.0
+    
+    # Gunakan range yang mencakup data jika data melebihi standar,
+    # seangkan standar jika data dalam batas standar
+    # Tapi juga pertimbangkan ukuran terukur untuk data yang aneh
+    if tegangan_pp_terukur is not None and data_max > 1.5:
+        # Jika ukuran teruker menunjukkan range yang sangat berbeda dari data mentah,
+        # berikan kemungkinan auto scale berdasarkan data terukur
+        if tegangan_pp_terukur > y_standard_max * 1.5:
+            # Data terukur melebihi standar signifikan, gunakan data terukur
+            data_max = tegangan_peak2peak_max = tegangan_pp_terukur
+            data_min = 0.0
+        elif tegangan_pp_terukur < y_standard_max * 0.3 and data_max < y_standard_max * 1.5:
+            # Data terukur menunjukkan sinyal lebih kecil, perbaiki scaling
+            pass  # Pertahankan setting standar
+    
+    if data_max > y_standard_max or data_min < y_standard_min:
+        # Data melebihi standar, auto scale total
+        ax.set_ylim(data_min - margin_v, data_max + margin_v)
+    else:
+        # Data dalam standar, gunakan batas Volt/div x 8
+        ax.set_ylim(y_standard_min, y_standard_max)
+    
+    # Atur tick sesuai range baru
+    ax.xaxis.set_major_locator(MaxNLocator(nbins=5))
+    ax.yaxis.set_major_locator(MaxNLocator(nbins=3))
+    
+    canvas.draw()
+
+
+def update_plot(durasi_simulasi):
+    """Update plot using time/div, volt/div, and position controls - oscilloscope style"""
+    # Dapatkan nilai dari kontrol tampilan
+    time_div = float(spin_time_div.get())
+    volt_div = float(spin_volt_div.get())
+    hor_pos = float(spin_hor_pos.get())
+    ver_pos = float(spin_ver_pos.get())
+    trig_level = float(spin_trig_level.get())
+    
+    # Dapatkan ukuran dari data sinyal sebenarnya untuk bantuan default
+    ukuran = hitung_ukuran_dari_data(hasil)
+    
+    # === Time/div: skala waktu per divisi horizontal ===
+    # Grafik menampilkan 10 divisi horizontal
+    # Rentang waktu total = Time/div x 10 divisi
+    # Contoh: Time/div 0.1 -> X 0 sampai 1 detik, Time/div 0.2 -> X 0 sampai 2 detik
+    num_horizontal_divisions = 10
+    x_max = time_div * num_horizontal_divisions
+    
+    # Terapkan Horizontal Position: geser rentang waktu yang ditampilkan
+    # hor_pos dalam satuan detik, geser mulai dari posisi tersebut
+    x_start = hor_pos
+    x_end = hor_pos + x_max
+    
+    # Hitung indeks data yang sesuai dengan rentang x_start ke x_end
+    # data waktu: 0 sampai durasi_simulasi
+    n_titik = len(hasil["waktu"])
+    # Normalisasi rentang ke domain data 0..n_titik
+    idx_start = max(0, min(n_titik - 1, int(n_titik * (x_start / durasi_simulasi) if durasi_simulasi > 0 else 0)))
+    idx_end = max(1, min(n_titik, int(n_titik * (x_end / durasi_simulasi) if durasi_simulasi > 0 else n_titik)))
+    
+    # Pastikan idx_start < idx_end untuk data yang valid
+    if idx_start >= idx_end:
+        idx_start = 0
+        idx_end = n_titik
+    
+    # Ambil subset data untuk ditampilkan
+    waktu_tampil = hasil["waktu"][idx_start:idx_end]
+    sinyal_asli = hasil["sinyal"][idx_start:idx_end]
+    
+    # Terapkan Vertical Position: geser amplitudo sinyal
+    # ver_pos dalam satuan volt, ditambah ke data sinyal float
+    sinyal_float = sinyal_asli.astype(float) + ver_pos
+    
+    # Gunakan duty cycle terukur sebagai referensi untuk trig level default
+    if ukuran["duty_cycle_terukur"] is not None and trig_level == 0.5:
+        # Jika trig level masih default (0.5) dan ada ukuran terukur,
+        # sesuaikan trig level agar tepat di tengah crossing
+        duty_terukur = ukuran["duty_cycle_terukur"]
+        if duty_terukur < 50:
+            trig_level_default = 0.2
+        elif duty_terukur > 50:
+            trig_level_default = 0.8
+        else:
+            trig_level_default = 0.5
+        # Hanya gunakan jika belum user mengubah trig level manually
+        # (spin_trig_level value akan menggantikan jika user berebut)
+    
+    # Terapkan Trigger Level: tentukan titik awal berdasarkan persilangan level naik
+    # Cari indeks pertama di mana sinyal naik melalui trig_level (dari data sudah di-shift vertikal)
+    idx_trigger = 0
+    for i in range(1, len(sinyal_float)):
+        if sinyal_float[i-1] < trig_level and sinyal_float[i] >= trig_level:
+            idx_trigger = i
+            break
+    
+    # Jika ada persilangan naik, geser start index ke sana
+    # Tapi pastikan tetap memiliki data yang cukup dan dalam bounds
+    if idx_trigger > 0:
+        geser = idx_trigger
+        # Pastikan tidak melewati batas akhir
+        if idx_start + geser < n_titik - 1:
+            idx_start_baru = idx_start + geser
+            # Sesuaikan end index agar panjang tetap sesuai
+            panjang_diperlukan = idx_end - idx_start
+            idx_end_baru = min(n_titik, idx_start_baru + panjang_diperlukan)
+            
+            # Slice ulang dengan indeks baru
+            waktu_tampil = hasil["waktu"][idx_start_baru:idx_end_baru]
+            # Adjust sinyal_float positions relative to new start
+            offset = idx_start_baru - idx_start
+            sinyal_float = sinyal_float[offset:offset + (idx_end_baru - idx_start_baru)]
+        else:
+            # Jika sudah dekat batas, gunakan data asli tanpa geser tambahan
+            waktu_tampil = hasil["waktu"][idx_start:idx_end]
+    
+    # === Time/div: skala waktu per divisi horizontal ===
+    # Grafik menampilkan 10 divisi horizontal
+    
+    # Clear axes and set up plot
+    ax.clear()
+    
+    # Set x-axis berdasarkan rentang waktu yang telah di-shift
+    # Pastikan x_end > x_start untuk validitas sumbu
+    if x_end > x_start:
+        ax.set_xlim(x_start, x_end)
+    else:
+        ax.set_xlim(x_start, x_start + 1)
+    
+    # Atur tick X sesuai time/div: tampilkan tick setiap 1 divisi
+    xtick_vals = [i * time_div for i in range(num_horizontal_divisions + 1)]
+    # Hapus tick duplicate agar tampilan bersih
+    unique_xticks = []
+    for t in xtick_vals:
+        if t not in unique_xticks:
+            unique_xticks.append(t)
+    ax.set_xticks(unique_xticks)
+    ax.set_xticklabels([f'{t:.1f}' for t in unique_xticks])
+    
+    # === Volt/div: skala tegangan per divisi vertikal ===
+    # Grafik menampilkan 8 divisi vertikal
+    # Rentang tegangan total = Volt/div x 8 divisi
+    # Contoh: Volt/div 1 -> Y 0 sampai 8V, Volt/div 0.5 -> Y 0 sampai 4V
+    # Sinyal PWM memiliki amplitudo FIXED 0-1V, tampilkan dalam rentang ini
+    # Jika Volt/div terlalu kecil, sinyal HIGH akan keluar dari atas grafik (behavior osiloskop)
+    # FIX: Pastikan y-axis selalu mencakup sinyal_float setelah ver_pos diterapkan
+    num_vertical_divisions = 8
+    
+    # Gunakan range data terukur untuk membantuan pengaturan y-axis
+    if ukuran["tegangan_peak2peak"] is not None:
+        tegangan_pp_terukur = ukuran["tegangan_peak2peak"]
+    else:
+        tegangan_pp_terukur = None
+    
+    # Hitung y_max yang mencakup sinyal dengan margin
+    if len(sinyal_float) > 0:
+        sinyal_min = sinyal_float.min()
+        sinyal_max = sinyal_float.max()
+        sinyal_range = abs(sinyal_max - sinyal_min)
+        
+        # Tambah margin 20% dari range sinyal, minimal 1V di setiap ujung
+        margin = max(sinyal_range * 0.2, 1.0)
+        y_max = sinyal_max + margin
+        y_min_aktual = sinyal_min - margin
+    else:
+        # Fallback ke setting standar
+        y_max = volt_div * num_vertical_divisions
+        y_min_aktual = 0.0
+    
+    # Atur y-axis: selalu mencakup sinyal dengan margin
+    ax.set_ylim(y_min_aktual, y_max)
+    
+    # Atur tick Y: tampilkan nilai volt setiap divisi
+    # Tentukan step tick berdasarkan range y-axis
+    y_range = y_max - y_min_aktual
+    tick_step = max(volt_div, y_range / 8)
+    
+    # Generate tick labels yang mencakup penuh range y-axis
+    ytick_vals = [round(y_min_aktual, 1)]
+    v = round(y_min_aktual + tick_step, 1)
+    while v <= round(y_max, 1) + 0.05:
+        ytick_vals.append(v)
+        v += tick_step
+    
+    # Pastikan y_max ada di tick terakhir
+    if ytick_vals and ytick_vals[-1] < round(y_max, 1):
+        ytick_vals.append(round(y_max, 1))
+    
+    # Batasi jumlah tick agar tidak terlalu banyak
+    if len(ytick_vals) > 15:
+        tick_step = y_range / 8
+        ytick_vals = []
+        v = round(y_min_aktual, 1)
+        for i in range(9):
+            ytick_vals.append(round(v + i * tick_step, 1))
+    
+    ax.set_yticks(ytick_vals)
+    # Label dengan 1 desimal, filter nilai yang tidak masuk range
+    ytick_labels = [f'{v:.1f}' if y_min_aktual - 0.5 <= v <= y_max + 0.5 else '' for v in ytick_vals]
+    ax.set_yticklabels(ytick_labels)
+    
+    # Plot data - data sinyal telah di-shift vertikal dan dipotong sesuai waktu
+    # serta di-trigger sesuai trig_level jika ditemukan
+    ax.plot(waktu_tampil, sinyal_float)
+    ax.set_title("WaveMind AI - Simulasi Gelombang PWM", pad=10)
+    ax.set_xlabel("Waktu (detik)")
+    ax.set_ylabel("Tegangan (V)")
+    fig.tight_layout()
+    ax.grid(True)
+    canvas.draw()
+
+
+# --- Window utama Tkinter ---
+root = tk.Tk()
+root.title("WaveMind AI - Simulasi PWM")
+root.geometry("800x600")
+
+# --- Kontrol tampilan osiloskop ---
+frame_controls = tk.Frame(root)
+frame_controls.pack(pady=5)
+
+tk.Label(frame_controls, text="Time/div (s):").grid(row=0, column=0)
+spin_time_div = tk.Spinbox(frame_controls, from_=0.1, to=10, increment=0.1, width=5)
+spin_time_div.grid(row=0, column=1)
+spin_time_div.delete(0, "end")
+spin_time_div.insert(0, "1")
+
+tk.Label(frame_controls, text="Volt/div (V):").grid(row=0, column=2)
+spin_volt_div = tk.Spinbox(frame_controls, from_=0.1, to=5, increment=0.1, width=5)
+spin_volt_div.grid(row=0, column=3)
+spin_volt_div.delete(0, "end")
+spin_volt_div.insert(0, "1")
+
+tk.Label(frame_controls, text="Hor Pos (s):").grid(row=0, column=4)
+spin_hor_pos = tk.Spinbox(frame_controls, from_=-10.0, to=10.0, increment=0.5, width=5)
+spin_hor_pos.grid(row=0, column=5)
+spin_hor_pos.delete(0, "end")
+spin_hor_pos.insert(0, "0.0")
+
+tk.Label(frame_controls, text="Ver Pos (V):").grid(row=0, column=6)
+spin_ver_pos = tk.Spinbox(frame_controls, from_=-5.0, to=5.0, increment=0.5, width=5)
+spin_ver_pos.grid(row=0, column=7)
+spin_ver_pos.delete(0, "end")
+spin_ver_pos.insert(0, "0.0")
+
+tk.Label(frame_controls, text="Trig Lvl (V):").grid(row=1, column=0)
+spin_trig_level = tk.Spinbox(frame_controls, from_=0.0, to=1.0, increment=0.1, width=5)
+spin_trig_level.grid(row=1, column=1)
+spin_trig_level.delete(0, "end")
+spin_trig_level.insert(0, "0.5")
+
+btn_auto_scale = tk.Button(frame_controls, text="Auto Scale", command=auto_scale)
+btn_auto_scale.grid(row=1, column=2, padx=5, pady=5)
+
+# Frame input
+frame_input = tk.Frame(root)
+frame_input.pack(pady=10)
+
+tk.Label(frame_input, text="Frekuensi (Hz):").grid(row=0, column=0)
+entry_frekuensi = tk.Entry(frame_input, width=10)
+entry_frekuensi.grid(row=0, column=1)
+entry_frekuensi.insert(0, "4")
+
+tk.Label(frame_input, text="Duty Cycle (%):").grid(row=0, column=2)
+entry_duty = tk.Entry(frame_input, width=10)
+entry_duty.grid(row=0, column=3)
+entry_duty.insert(0, "25")
+
+tk.Label(frame_input, text="Durasi (s):").grid(row=0, column=4)
+entry_durasi = tk.Entry(frame_input, width=10)
+entry_durasi.grid(row=0, column=5)
+entry_durasi.insert(0, "2")
+
+btn_generate = tk.Button(frame_input, text="Generate", command=on_generate)
+btn_generate.grid(row=0, column=6, padx=5)
+
+# Frame untuk grafik dan hasil
+frame_display = tk.Frame(root)
+frame_display.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+# Penampung sampel ADC dari ESP32
+adc_data = deque(maxlen=500)
+sample_index = deque(maxlen=500)
+
+# Matplotlib figure ditanam di dalam Tkinter
+fig = plt.Figure(figsize=(8, 4))
+ax = fig.add_subplot(111)
+ax.plot([], [])
+canvas = FigureCanvasTkAgg(fig, master=frame_display)
+canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+# Membaca data ADC dari ESP32
+def read_esp32():
+    try:
+        with serial.Serial("COM7", 115200, timeout=1) as ser:
+            while True:
+                line = ser.readline().decode(
+                    "utf-8", errors="ignore"
+                ).strip()
+
+                if line.startswith("ADC:"):
+                    try:
+                        value = int(line.split(":")[1])
+                        adc_data.append(value)
+                        sample_index.append(
+                            sample_index[-1] + 1
+                            if sample_index else 0
+                        )
+                    except ValueError:
+                        pass
+    except serial.SerialException as e:
+        print("Gagal membuka ESP32:", e)
+
+# Text result
+text_result = tk.Label(frame_display, text="", justify=tk.LEFT)
+text_result.pack(side=tk.BOTTOM, fill=tk.X, pady=5)
+
+# Tombol Generate pertama kali menunjukkan hasil default
+on_generate()
+
+# Memperbarui grafik dari data ESP32
+def update_esp32_plot():
+    if adc_data:
+        ax.clear()
+        ax.plot(list(sample_index), list(adc_data))
+        ax.set_title("WaveMind AI - Sinyal ESP32")
+        ax.set_xlabel("Sampel")
+        ax.set_ylabel("Nilai ADC (0-4095)")
+        ax.set_ylim(-100, 4200)
+        ax.grid(True)
+        canvas.draw_idle()
+
+    root.after(100, update_esp32_plot)
+
+# Jalankan pembaca ESP32 di thread terpisah
+esp32_thread = threading.Thread(target=read_esp32, daemon=True)
+esp32_thread.start()
+
+# Mulai pembaruan grafik
+update_esp32_plot()
+
+# Jalankan aplikasi
+root.mainloop()

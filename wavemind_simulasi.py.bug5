@@ -1,0 +1,741 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.ticker import MaxNLocator, FixedLocator
+import tkinter as tk
+from tkinter import messagebox, ttk
+import serial
+import threading
+import time
+from collections import deque
+
+
+# Variabel global untuk menyimpan hasil simulasi
+hasil = {}
+
+# Variabel kontrol tampilan tambahan
+hor_pos = 0.0  # Horizontal position in seconds (default 0)
+ver_pos = 0.0  # Vertical position in volts (default 0)
+trig_level = 0.5  # Trigger level in volts (default 0.5)
+
+# Referensi tegangan ADC (volt) - konfigurabel
+adc_reference = 3.3  # Referensi default ESP32
+
+# Tracker untuk jadwal after() - digunakan untuk cancel saat mode berubah
+after_id = None
+
+# Tracker waktu sampel untuk kalkulasi time base
+sample_timestamps = deque(maxlen=12000)
+sample_timestamps_2 = deque(maxlen=12000)
+
+# Koneksi serial generator dipakai bersama oleh thread pembaca dan tombol menu.
+serial_generator = None
+serial_generator_lock = threading.Lock()
+serial_generator_status = None
+esp1_numeric_lines = 0
+esp1_last_raw = None
+esp1_last_line = ""
+
+
+def safe_float(widget, default):
+    """Baca nilai Spinbox dengan aman saat pengguna sedang mengeditnya."""
+    try:
+        raw = widget.get().strip()
+        if not raw:
+            return float(default)
+        value = float(raw)
+        if not np.isfinite(value):
+            return float(default)
+        return value
+    except (ValueError, TypeError, AttributeError):
+        return float(default)
+
+
+# --- Fungsi pengukuran otomatis dari data sinyal gelombang ---
+def hitung_ukuran_dari_data(hasil):
+    """Hitung ukuran gelombang dari data sinyal sebenarnya (bukan parameter input)"""
+    if not hasil or "sinyal" not in hasil or "waktu" not in hasil:
+        return {
+            "frekuensi_terukur": None,
+            "duty_cycle_terukur": None,
+            "tegangan_peak2peak": None,
+            "tegangan_max": None,
+            "tegangan_min": None,
+            "tegangan_rms": None,
+        }
+
+    sinyal = hasil["sinyal"]
+    waktu = hasil["waktu"]
+    n = len(sinyal)
+
+    # Konversi ke float untuk perhitungan voltage
+    sinyal_float = sinyal.astype(float)
+
+    # --- Ukuran Frekuensi dari data ---
+    # Deteksi transisi naik (0 -> 1) untuk menghitung periode
+    periode_terdeteksi = None
+    indeks_naik = []
+    for i in range(1, n):
+        if sinyal_float[i - 1] == 0 and sinyal_float[i] == 1:
+            indeks_naik.append(i)
+
+    if len(indeks_naik) >= 2:
+        # Gunakan dua transisi naik pertama untuk estimasi periode
+        dt = waktu[indeks_naik[1]] - waktu[indeks_naik[0]]
+        if dt > 0:
+            periode_terdeteksi = dt
+    frekuensi_terukur = (1.0 / periode_terdeteksi) if periode_terdeteksi else None
+
+    # --- Ukuran Duty Cycle dari data ---
+    # Hitung proporsi waktu HIGH per periode yang terdeteksi
+    duty_cycle_terukur = None
+    if periode_terdeteksi and len(indeks_naik) > 0:
+        # Untuk setiap transisi naik, hitung lama HIGH berikutnya
+        total_high = 0
+        count = 0
+        for idx in indeks_naik[:4]:  # Gunakan hingga 4 periode untuk akurasi
+            # Cari transisi turun selanjutnya
+            for j in range(idx + 1, n):
+                if sinyal_float[j - 1] == 1 and sinyal_float[j] == 0:
+                    high_duration = waktu[j] - waktu[idx]
+                    total_high += high_duration
+                    count += 1
+                    break
+            if count >= 4:
+                break
+        if count > 0:
+            rata_rata_period = periode_terdeteksi
+            duty_cycle_terukur = (total_high / (count * rata_rata_period)) * 100 if rata_rata_period > 0 else None
+
+    # --- Ukuran Tegangan dari data (setelah ver_pos shift) ---
+    sinial_shifted = sinyal_float + ver_pos  # Apply vertical position
+
+    tegangan_max = float(sinial_shifted.max()) if len(sinial_shifted) > 0 else None
+    tegangan_min = float(sinial_shifted.min()) if len(sinial_shifted) > 0 else None
+    tegangan_peak2peak = tegangan_max - tegangan_min if tegangan_max is not None and tegangan_min is not None else None
+
+    # RMS voltage (root mean square)
+    tegangan_rms = float(np.sqrt(np.mean(sinial_shifted ** 2))) if len(sinial_shifted) > 0 and np is not None else None
+
+    return {
+        "frekuensi_terukur": round(frekuensi_terukur, 2) if frekuensi_terukur else None,
+        "duty_cycle_terukur": round(duty_cycle_terukur, 1) if duty_cycle_terukur else None,
+        "tegangan_peak2peak": round(tegangan_peak2peak, 2) if tegangan_peak2peak else None,
+        "tegangan_max": round(tegangan_max, 2) if tegangan_max else None,
+        "tegangan_min": round(tegangan_min, 2) if tegangan_min else None,
+        "tegangan_rms": round(tegangan_rms, 3) if tegangan_rms else None,
+    }
+
+# --- Fungsi simulasi (dihormat dari wavemind_simulasi.py) ---
+def run_simulation(frekuensi, duty_cycle, durasi):
+    jumlah_titik = 2000
+    waktu = np.linspace(0, durasi, jumlah_titik)
+    periode = 1 / frekuensi
+    waktu_high = periode * duty_cycle / 100
+    waktu_low = periode - waktu_high
+
+    posisi = (waktu % periode) / periode
+    sinyal = (posisi < duty_cycle / 100).astype(int)
+
+    hasil = {
+        "frekuensi": frekuensi,
+        "periode": periode,
+        "duty_cycle": duty_cycle,
+        "waktu_high": waktu_high,
+        "waktu_low": waktu_low,
+        "sinyal": sinyal,
+        "waktu": waktu,
+    }
+    return hasil
+
+
+# --- Penjelasan hasil dalam bahasa Indonesia ---
+def penjelasan(hasil):
+    lines = [
+        f"Frekuensi   : {hasil['frekuensi']} Hz",
+        f"Periode     : {hasil['periode']:.3f} detik",
+        f"Duty Cycle  : {hasil['duty_cycle']}%",
+        f"Waktu HIGH  : {hasil['waktu_high']:.3f} detik",
+        f"Waktu LOW   : {hasil['waktu_low']:.3f} detik",
+    ]
+    if hasil["duty_cycle"] == 50:
+        lines.append("Sinyal memiliki waktu HIGH dan LOW yang sama.")
+    elif hasil["duty_cycle"] < 50:
+        lines.append("Sinyal memiliki waktu HIGH lebih singkat daripada LOW.")
+    else:
+        lines.append("Sinyal memiliki waktu HIGH lebih lama daripada LOW.")
+
+    # Tambahkan ukuran dari data sinyal sebenarnya
+    ukuran = hitung_ukuran_dari_data(hasil)
+    if ukuran["frekuensi_terukur"] is not None:
+        lines.append(f"Frekuensi terukur: {ukuran['frekuensi_terukur']} Hz")
+    if ukuran["duty_cycle_terukur"] is not None:
+        lines.append(f"Duty cycle terukur: {ukuran['duty_cycle_terukur']}%")
+    if ukuran["tegangan_peak2peak"] is not None:
+        lines.append(f"Tegangan peak-to-peak: {ukuran['tegangan_peak2peak']} V")
+    if ukuran["tegangan_max"] is not None:
+        lines.append(f"Tegangan max: {ukuran['tegangan_max']} V")
+    if ukuran["tegangan_min"] is not None:
+        lines.append(f"Tegangan min: {ukuran['tegangan_min']} V")
+    if ukuran["tegangan_rms"] is not None:
+        lines.append(f"Tegangan RMS: {ukuran['tegangan_rms']} V")
+
+    return "\n".join(lines)
+
+
+# --- Fungsi pembaruan mode dan cleanup ---
+def toggle_mode():
+    """Cancel pending after callbacks and reset state when mode changes"""
+    global after_id
+    if after_id is not None:
+        root.after_cancel(after_id)
+        after_id = None
+
+# --- Fungsi callback tombol Generate ---
+def on_generate():
+    global hasil
+    try:
+        frekuensi = float(entry_frekuensi.get())
+        duty_cycle = float(entry_duty.get())
+        durasi = float(entry_durasi.get())
+    except ValueError:
+        messagebox.showerror("Input Error", "Masukkan angka yang valid.")
+        return
+
+    if frekuensi <= 0:
+        messagebox.showerror("Input Error", "Frekuensi harus lebih besar dari nol.")
+        return
+    if not (0 <= duty_cycle <= 100):
+        messagebox.showerror("Input Error", "Duty cycle harus antara 0 hingga 100 persen.")
+        return
+
+    hasil = run_simulation(frekuensi, duty_cycle, durasi)
+
+    # Update text result
+    text_result.config(text=penjelasan(hasil))
+
+    # Update plot with display controls (uses current spinbox values)
+    update_plot(durasi)
+
+
+def auto_scale():
+    """Sesuaikan Volt/div berdasarkan data aktif tanpa mengubah hasil pengukuran."""
+    if mode.get() == "REAL-TIME" and adc_data:
+        scale_max = max(safe_float(spin_adc_ref, 2.67), 0.001)
+        values = [(v / 4095.0) * scale_max for v in list(adc_data)]
+    elif mode.get() == "REAL-TIME2" and adc_data_2:
+        scale_max = max(safe_float(spin_adc_ref2, 3.3), 0.001)
+        values = [(v / 4095.0) * scale_max for v in list(adc_data_2)]
+    elif hasil and "sinyal" in hasil:
+        values = list(hasil["sinyal"].astype(float))
+    else:
+        return
+    if not values:
+        return
+    low, high = min(values), max(values)
+    span = max(high - low, 0.1)
+    # 8 divisi vertikal; sisakan margin sekitar 20%.
+    recommended = span * 1.2 / 8.0
+    recommended = max(0.1, round(recommended / 0.1) * 0.1)
+    spin_volt_div.delete(0, "end")
+    spin_volt_div.insert(0, f"{recommended:.1f}")
+    if mode.get() == "SIMULASI":
+        update_plot(safe_float(entry_durasi, 2.0))
+    elif mode.get() == "REAL-TIME":
+        plot_esp1_realtime()
+    else:
+        plot_realtime(adc_data_2, sample_timestamps_2, spin_adc_ref2, "adc", "WaveMind AI - Sinyal ADC ESP32 #2")
+
+
+def update_plot(durasi_simulasi):
+    """Plot simulasi dengan Time/div, Volt/div, Hor Pos, Ver Pos, dan trigger."""
+    if mode.get() != "SIMULASI" or not hasil:
+        return
+    time_div = max(safe_float(spin_time_div, 0.1), 0.001)
+    volt_div = max(safe_float(spin_volt_div, 0.5), 0.001)
+    hor_pos_value = safe_float(spin_hor_pos, 0.0)
+    ver_pos_value = safe_float(spin_ver_pos, 0.0)
+    trig_level = safe_float(spin_trig_level, 0.5)
+    waktu = hasil["waktu"]
+    sinyal = hasil["sinyal"].astype(float)
+    x_span = time_div * 10.0
+    x_start = max(0.0, hor_pos_value)
+    x_end = x_start + x_span
+    mask = (waktu >= x_start) & (waktu <= x_end)
+    t_view = waktu[mask]
+    y_view = sinyal[mask] + ver_pos_value
+    ax.clear()
+    if len(t_view):
+        ax.plot(t_view - x_start, y_view, linewidth=1.2)
+    ax.set_xlim(0.0, x_span)
+    y_center = 0.5
+    y_min = y_center - 4.0 * volt_div
+    y_max = y_center + 4.0 * volt_div
+    ax.set_ylim(y_min, y_max)
+    ax.set_xticks([i * time_div for i in range(11)])
+    ax.set_yticks([y_min + i * volt_div for i in range(9)])
+    ax.axhline(trig_level + ver_pos_value, linestyle="--", linewidth=0.8, alpha=0.7)
+    ax.set_title("WaveMind AI - Simulasi Gelombang PWM")
+    ax.set_xlabel("Waktu (detik)")
+    ax.set_ylabel("Tegangan (V)")
+    ax.grid(True, which="major", alpha=0.65)
+    fig.tight_layout()
+    canvas.draw_idle()
+
+
+# --- Window utama Tkinter ---
+root = tk.Tk()
+root.title("WaveMind AI - Simulasi PWM")
+root.geometry("1150x760")
+
+# Mode operasi: SIMULASI atau REAL-TIME
+mode = tk.StringVar(master=root, value="SIMULASI")
+mode.trace_add("write", lambda *args: toggle_mode())
+
+# --- Kontrol tampilan osiloskop ---
+frame_controls = tk.Frame(root)
+frame_controls.pack(pady=5)
+
+tk.Label(frame_controls, text="Time/div (s):").grid(row=0, column=0)
+spin_time_div = tk.Spinbox(frame_controls, from_=0.1, to=10, increment=0.1, width=5)
+spin_time_div.grid(row=0, column=1)
+spin_time_div.delete(0, "end")
+spin_time_div.insert(0, "1")
+
+tk.Label(frame_controls, text="Volt/div (V):").grid(row=0, column=2)
+spin_volt_div = tk.Spinbox(frame_controls, from_=0.1, to=5, increment=0.1, width=5)
+spin_volt_div.grid(row=0, column=3)
+spin_volt_div.delete(0, "end")
+spin_volt_div.insert(0, "1")
+
+tk.Label(frame_controls, text="Hor Pos (s):").grid(row=0, column=4)
+spin_hor_pos = tk.Spinbox(frame_controls, from_=0.0, to=10.0, increment=0.1, width=5)
+spin_hor_pos.grid(row=0, column=5)
+spin_hor_pos.delete(0, "end")
+spin_hor_pos.insert(0, "0.0")
+
+tk.Label(frame_controls, text="Ver Pos (V):").grid(row=0, column=6)
+spin_ver_pos = tk.Spinbox(frame_controls, from_=-5.0, to=5.0, increment=0.5, width=5)
+spin_ver_pos.grid(row=0, column=7)
+spin_ver_pos.delete(0, "end")
+spin_ver_pos.insert(0, "0.0")
+
+tk.Label(frame_controls, text="Trig Lvl (V):").grid(row=1, column=0)
+spin_trig_level = tk.Spinbox(frame_controls, from_=0.0, to=3.3, increment=0.1, width=5)
+spin_trig_level.grid(row=1, column=1)
+spin_trig_level.delete(0, "end")
+spin_trig_level.insert(0, "1.3")
+
+tk.Label(frame_controls, text="DAC Max (V):").grid(row=1, column=2)
+spin_adc_ref = tk.Spinbox(frame_controls, from_=0.1, to=5.0, increment=0.1, width=5)
+spin_adc_ref.grid(row=1, column=3)
+spin_adc_ref.delete(0, "end")
+spin_adc_ref.insert(0, "2.67")
+
+tk.Label(frame_controls, text="ADC Ref #2 (V):").grid(row=1, column=4)
+spin_adc_ref2 = tk.Spinbox(frame_controls, from_=1.0, to=5.0, increment=0.1, width=5)
+spin_adc_ref2.grid(row=1, column=5)
+spin_adc_ref2.delete(0, "end")
+spin_adc_ref2.insert(0, "3.3")
+
+btn_auto_scale = tk.Button(frame_controls, text="Auto Scale", command=auto_scale)
+btn_auto_scale.grid(row=1, column=6, padx=5, pady=5)
+
+# Mode selector
+tk.Label(frame_controls, text="Mode:").grid(row=1, column=7, sticky='w')
+mode_simulasi = tk.Radiobutton(frame_controls, text="SIMULASI", variable=mode, value="SIMULASI")
+mode_simulasi.grid(row=1, column=8, sticky='w')
+mode_esp32 = tk.Radiobutton(frame_controls, text="REAL-TIME ESP32", variable=mode, value="REAL-TIME")
+mode_esp32.grid(row=1, column=9, sticky='w')
+mode_esp32_2 = tk.Radiobutton(frame_controls, text="REAL-TIME ESP32 #2", variable=mode, value="REAL-TIME2")
+mode_esp32_2.grid(row=1, column=10, sticky='w')
+
+# Frame input
+frame_input = tk.Frame(root)
+frame_input.pack(pady=10)
+
+tk.Label(frame_input, text="Frekuensi (Hz):").grid(row=0, column=0)
+entry_frekuensi = tk.Entry(frame_input, width=10)
+entry_frekuensi.grid(row=0, column=1)
+entry_frekuensi.insert(0, "4")
+
+tk.Label(frame_input, text="Duty Cycle (%):").grid(row=0, column=2)
+entry_duty = tk.Entry(frame_input, width=10)
+entry_duty.grid(row=0, column=3)
+entry_duty.insert(0, "25")
+
+tk.Label(frame_input, text="Durasi (s):").grid(row=0, column=4)
+entry_durasi = tk.Entry(frame_input, width=10)
+entry_durasi.grid(row=0, column=5)
+entry_durasi.insert(0, "2")
+
+btn_generate = tk.Button(frame_input, text="Generate", command=on_generate)
+btn_generate.grid(row=0, column=6, padx=5)
+
+# Kontrol langsung function generator ESP32 #1 (COM7)
+frame_generator = tk.LabelFrame(root, text="Kontrol Function Generator ESP32 #1 (COM7)")
+frame_generator.pack(fill=tk.X, padx=10, pady=3)
+
+tk.Label(frame_generator, text="Bentuk gelombang:").grid(row=0, column=0, padx=4, pady=4)
+waveform_choice = ttk.Combobox(
+    frame_generator, state="readonly", width=12,
+    values=("Sinus", "Kotak", "Segitiga")
+)
+waveform_choice.grid(row=0, column=1, padx=4, pady=4)
+waveform_choice.current(0)
+
+tk.Button(frame_generator, text="Terapkan Gelombang", command=lambda: send_generator_command(
+    {"Sinus": "1", "Kotak": "2", "Segitiga": "3"}.get(waveform_choice.get(), "1")
+)).grid(row=0, column=2, padx=4, pady=4)
+
+tk.Label(frame_generator, text="Frekuensi:").grid(row=0, column=3, padx=4, pady=4)
+frequency_choice = ttk.Combobox(
+    frame_generator, state="readonly", width=8,
+    values=("1 Hz", "2 Hz", "5 Hz", "10 Hz", "20 Hz", "50 Hz", "100 Hz")
+)
+frequency_choice.grid(row=0, column=4, padx=4, pady=4)
+frequency_choice.current(1)
+
+tk.Button(frame_generator, text="Atur Frekuensi", command=lambda: send_generator_command(
+    "F" + frequency_choice.get().split()[0]
+)).grid(row=0, column=5, padx=4, pady=4)
+
+serial_generator_status = tk.Label(frame_generator, text="Status generator: menunggu koneksi COM7", anchor="w")
+serial_generator_status.grid(row=1, column=0, columnspan=6, sticky="ew", padx=4, pady=2)
+
+# Frame untuk grafik dan hasil
+frame_display = tk.Frame(root)
+frame_display.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+# Penampung sampel ADC dari ESP32
+adc_data = deque(maxlen=12000)
+sample_index = deque(maxlen=12000)
+
+# Penampung sampel ADC dari ESP32 #2
+adc_data_2 = deque(maxlen=12000)
+sample_index_2 = deque(maxlen=12000)
+
+# Matplotlib figure ditanam di dalam Tkinter
+fig = plt.Figure(figsize=(8, 4))
+ax = fig.add_subplot(111)
+ax.plot([], [])
+canvas = FigureCanvasTkAgg(fig, master=frame_display)
+canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+# Membaca data ADC dari ESP32
+def read_esp32():
+    """Baca kode DAC ESP32 #1 dari COM7. Firmware mengirim angka 0..4095 per baris."""
+    global serial_generator, esp1_numeric_lines, esp1_last_raw, esp1_last_line
+    while True:
+        try:
+            with serial_generator_lock:
+                ser = serial_generator
+                need_open = ser is None or not ser.is_open
+
+            if need_open:
+                ser = serial.Serial("COM7", 115200, timeout=0.25, write_timeout=1)
+                with serial_generator_lock:
+                    serial_generator = ser
+                time.sleep(2)  # ESP32 biasanya reset saat port serial dibuka
+                with serial_generator_lock:
+                    if serial_generator is ser and ser.is_open:
+                        ser.reset_input_buffer()
+                if serial_generator_status is not None:
+                    root.after(0, lambda: serial_generator_status.config(
+                        text="Status generator: COM7 terbuka; menunggu data DAC..."
+                    ))
+
+            with serial_generator_lock:
+                ser = serial_generator
+            if ser is None or not ser.is_open:
+                time.sleep(0.05)
+                continue
+
+            line = ser.readline()
+            if not line:
+                continue
+
+            text_line = line.decode("ascii", errors="ignore").strip().lstrip("\\ufeff")
+            esp1_last_line = text_line
+            if not text_line:
+                continue
+
+            # Firmware saat ini mengirim angka polos via Serial.println(value).
+            # Format DAC:123 / ADC:123 juga diterima; baris menu diabaikan.
+            candidate = text_line
+            if ":" in candidate:
+                prefix, remainder = candidate.split(":", 1)
+                if prefix.strip().upper() in ("ADC", "DAC", "VALUE", "RAW"):
+                    candidate = remainder.strip()
+            if not candidate.isdigit():
+                continue
+
+            value = int(candidate)
+            if 0 <= value <= 4095:
+                stamp = time.monotonic()
+                adc_data.append(value)
+                sample_timestamps.append(stamp)
+                sample_index.append(sample_index[-1] + 1 if sample_index else 0)
+                esp1_numeric_lines += 1
+                esp1_last_raw = value
+
+        except (serial.SerialException, OSError, ValueError) as exc:
+            with serial_generator_lock:
+                old_ser = serial_generator
+                serial_generator = None
+            if old_ser is not None:
+                try:
+                    old_ser.close()
+                except Exception:
+                    pass
+            if serial_generator_status is not None:
+                try:
+                    root.after(0, lambda msg=str(exc): serial_generator_status.config(
+                        text=f"Status generator: gagal COM7 ({msg})"
+                    ))
+                except Exception:
+                    pass
+            time.sleep(1)
+
+
+def send_generator_command(command):
+    """Kirim menu gelombang (1/2/3) atau frekuensi (F1-F100) ke ESP32 #1."""
+    global serial_generator
+    try:
+        with serial_generator_lock:
+            ser = serial_generator
+            if ser is None or not ser.is_open:
+                messagebox.showwarning(
+                    "Generator belum terhubung",
+                    "ESP32 #1 belum terhubung ke COM7. Tutup Serial Monitor/Serial Plotter Arduino, lalu jalankan kembali aplikasi."
+                )
+                return
+            ser.write((command.strip() + "\n").encode("ascii"))
+            ser.flush()
+        if serial_generator_status is not None:
+            serial_generator_status.config(text=f"Perintah terkirim ke COM7: {command}")
+    except (serial.SerialException, OSError) as exc:
+        messagebox.showerror("Gagal mengirim perintah", f"Tidak dapat mengirim perintah ke ESP32 #1 COM7.\n{exc}")
+
+
+# Port serial tetap: generator ESP32 #1 = COM7, osiloskop ESP32 #2 = COM8.
+
+
+def read_esp32_2():
+    """Baca ADC ESP32 #2 dari COM pilihan; menerima angka saja atau ADC:angka."""
+    ser = None
+    active_port = None
+    while True:
+        try:
+            selected_port = "COM8"
+            if ser is None or not ser.is_open or selected_port != active_port:
+                if ser is not None:
+                    try: ser.close()
+                    except Exception: pass
+                ser = serial.Serial(selected_port, 115200, timeout=1)
+                active_port = selected_port
+                time.sleep(2)
+                ser.reset_input_buffer()
+            line = ser.readline().decode("utf-8", errors="ignore").strip()
+            if not line:
+                continue
+            try:
+                # Firmware pengguna mengirim angka ADC saja, misalnya 2048.
+                raw_value = line.split(":", 1)[1] if line.startswith("ADC:") else line
+                value = int(raw_value.strip())
+                if 0 <= value <= 4095:
+                    adc_data_2.append(value)
+                    sample_timestamps_2.append(time.time())
+                    sample_index_2.append(sample_index_2[-1] + 1 if sample_index_2 else 0)
+            except ValueError:
+                pass  # Abaikan header/baris non-angka
+        except (serial.SerialException, OSError, ValueError):
+            if ser is not None:
+                try: ser.close()
+                except Exception: pass
+            ser = None
+            active_port = None
+            time.sleep(2)
+
+# Text result
+text_result = tk.Label(frame_display, text="", justify=tk.LEFT)
+text_result.pack(side=tk.BOTTOM, fill=tk.X, pady=5)
+
+# Tombol Generate pertama kali menunjukkan hasil default
+on_generate()
+
+# Memperbarui grafik dari data ESP32
+def update_esp32_plot():
+    """Gambar kode DAC ESP32 #1 sebagai perkiraan tegangan keluaran."""
+    global after_id
+    if mode.get() == "REAL-TIME":
+        plot_esp1_realtime()
+    after_id = root.after(100, update_esp32_plot)
+
+
+
+
+
+# Fungsi pembaruan plot ESP32 #2
+def update_esp32_2_plot():
+    """Gambar pembacaan ADC ESP32 #2 sebagai tegangan perkiraan."""
+    if mode.get() == "REAL-TIME2":
+        plot_realtime(adc_data_2, sample_timestamps_2, spin_adc_ref2, "adc",
+                      "WaveMind AI - Sinyal ADC ESP32 #2")
+    root.after(100, update_esp32_2_plot)
+
+
+def plot_esp1_realtime():
+    """Plot ESP32 #1: Serial.println(value) mengirim kode DAC 0..4095."""
+    raw_values = list(adc_data)
+    ts = list(sample_timestamps)
+    n = min(len(raw_values), len(ts))
+
+    if n < 2:
+        serial_generator_status.config(
+            text=f"Status generator: COM7 terbuka, menunggu data angka (sampel: {n})"
+        )
+        return
+
+    raw_values, ts = raw_values[-n:], ts[-n:]
+    # Data timestamp dari time.monotonic() agar waktu selalu bergerak maju.
+    time_data = [t - ts[0] for t in ts]
+    t_latest = time_data[-1]
+
+    # Ini kode DAC, bukan data ADC. DAC Max adalah estimasi tegangan maksimum.
+    dac_max_v = max(safe_float(spin_adc_ref, 2.67), 0.001)
+    voltages = [(value / 4095.0) * dac_max_v for value in raw_values]
+
+    time_div = max(safe_float(spin_time_div, 0.1), 0.001)
+    x_span = time_div * 10.0
+    hor_offset = max(0.0, safe_float(spin_hor_pos, 0.0))
+    window_end = t_latest - hor_offset
+    window_start = window_end - x_span
+
+    trig_level = safe_float(spin_trig_level, 1.3)
+    crossings = [
+        i for i in range(1, n)
+        if voltages[i - 1] < trig_level <= voltages[i]
+        and window_start <= time_data[i] <= window_end
+    ]
+    if crossings and hor_offset == 0.0:
+        window_start = time_data[crossings[-1]] - 0.20 * x_span
+        window_end = window_start + x_span
+
+    indices = [i for i, t in enumerate(time_data) if window_start <= t <= window_end]
+    if not indices:
+        # Tetap tampilkan sampel terbaru jika data belum mengisi satu layar penuh.
+        count = min(n, 2000)
+        indices = list(range(n - count, n))
+        if indices:
+            window_end = time_data[indices[-1]]
+            window_start = window_end - x_span
+
+    ax.clear()
+    volt_div = max(safe_float(spin_volt_div, 0.5), 0.001)
+    ver_pos = safe_float(spin_ver_pos, 0.0)
+    y_center = dac_max_v / 2.0 + ver_pos
+    y_min = y_center - 4.0 * volt_div
+    y_max = y_center + 4.0 * volt_div
+    ax.set_ylim(y_min, y_max)
+    ax.set_xlim(0.0, x_span)
+
+    if indices:
+        x_plot = [time_data[i] - window_start for i in indices]
+        y_plot = [voltages[i] + ver_pos for i in indices]
+        ax.plot(x_plot, y_plot, linewidth=1.0)
+
+        vmin = min(voltages[i] for i in indices)
+        vmax = max(voltages[i] for i in indices)
+        text_result.config(
+            text=f"Kode DAC terakhir: {raw_values[-1]} | "
+                 f"Vmin perkiraan: {vmin:.3f} V | Vmax perkiraan: {vmax:.3f} V | "
+                 f"Vpp perkiraan: {vmax-vmin:.3f} V"
+                 f"\\nSampel buffer: {n} | ditampilkan: {len(indices)}"
+        )
+        serial_generator_status.config(
+            text=f"Status generator: COM7 aktif | angka diterima: {esp1_numeric_lines} | "
+                 f"kode terakhir: {raw_values[-1]}"
+        )
+
+    ax.set_xticks([i * time_div for i in range(11)])
+    ax.set_yticks([y_min + i * volt_div for i in range(9)])
+    ax.axhline(trig_level + ver_pos, linestyle="--", linewidth=0.8, alpha=0.55)
+    ax.set_title("WaveMind AI - Kode DAC / Keluaran perkiraan ESP32 #1")
+    ax.set_xlabel("Waktu (detik)")
+    ax.set_ylabel("Tegangan perkiraan (V)")
+    ax.grid(True, which="major", alpha=0.65)
+    canvas.draw_idle()
+
+
+def plot_realtime(raw_buffer, timestamps, scale_widget, scale_kind, title):
+    """Plot real-time dengan skala tetap, jendela waktu, trigger dan posisi."""
+    raw_values = list(raw_buffer)
+    ts = list(timestamps)
+    if len(raw_values) < 2 or len(ts) < 2:
+        return
+    n = min(len(raw_values), len(ts))
+    raw_values, ts = raw_values[-n:], ts[-n:]
+    time_data = [t - ts[0] for t in ts]
+    t_latest = time_data[-1]
+    scale_max = max(safe_float(scale_widget, 3.3), 0.001)
+    # ESP32 #1 sends DAC codes; ESP32 #2 sends raw ADC codes.
+    voltages = [(v / 4095.0) * scale_max for v in raw_values]
+    time_div = max(safe_float(spin_time_div, 0.1), 0.001)
+    x_span = time_div * 10.0
+    hor_offset = safe_float(spin_hor_pos, 0.0)
+    window_end = t_latest - hor_offset
+    window_start = window_end - x_span
+    trig_level = safe_float(spin_trig_level, 1.3)
+    crossings = [i for i in range(1, n)
+                 if voltages[i-1] < trig_level <= voltages[i]
+                 and window_start <= time_data[i] <= window_end]
+    if crossings and abs(hor_offset) < 1e-12:
+        # Keep 20% of the screen before the most recent rising trigger edge.
+        window_start = time_data[crossings[-1]] - 0.20 * x_span
+        window_end = window_start + x_span
+    indices = [i for i, t in enumerate(time_data) if window_start <= t <= window_end]
+    # Jika jendela waktu tidak berisi sampel (misalnya Hor Pos terlalu besar),
+    # tetap tampilkan sampel terbaru agar grafik tidak kosong.
+    if not indices and time_data:
+        count = min(n, 1000)
+        indices = list(range(n - count, n))
+        window_start = time_data[indices[0]]
+        window_end = window_start + x_span
+    ax.clear()
+    volt_div = max(safe_float(spin_volt_div, 0.5), 0.001)
+    ver_pos = safe_float(spin_ver_pos, 0.0)
+    y_center = scale_max / 2.0
+    y_min, y_max = y_center - 4.0 * volt_div, y_center + 4.0 * volt_div
+    ax.set_ylim(y_min, y_max)
+    ax.set_xlim(0.0, x_span)
+    if indices:
+        x_plot = [time_data[i] - window_start for i in indices]
+        y_plot = [voltages[i] + ver_pos for i in indices]
+        ax.plot(x_plot, y_plot, linewidth=1.0)
+    ax.set_xticks([i * time_div for i in range(11)])
+    ax.set_yticks([y_min + i * volt_div for i in range(9)])
+    ax.axhline(trig_level + ver_pos, linestyle="--", linewidth=0.8, alpha=0.55)
+    if indices:
+        vmin, vmax = min(voltages[i] for i in indices), max(voltages[i] for i in indices)
+        text_result.config(text=f"Vmin: {vmin:.3f} V    Vmax: {vmax:.3f} V    Vpp: {vmax-vmin:.3f} V\nTrigger: {trig_level:.2f} V    Sampel ditampilkan: {len(indices)}")
+    ax.set_title(title)
+    ax.set_xlabel("Waktu (detik)")
+    ax.set_ylabel("Tegangan (V)")
+    ax.grid(True, which="major", alpha=0.65)
+    canvas.draw_idle()
+
+# Jalankan pembaca ESP32 di thread terpisah
+esp32_thread = threading.Thread(target=read_esp32, daemon=True)
+esp32_thread.start()
+
+# Jalankan pembaca ESP32 #2 di thread terpisah
+esp32_thread_2 = threading.Thread(target=read_esp32_2, daemon=True)
+esp32_thread_2.start()
+
+# Mulai pembaruan grafik
+update_esp32_plot()
+update_esp32_2_plot()
+
+# Jalankan aplikasi
+root.mainloop()
